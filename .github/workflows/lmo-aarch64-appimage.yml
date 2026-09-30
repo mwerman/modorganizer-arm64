@@ -1,0 +1,242 @@
+name: LMO aarch64 AppImage
+
+# Builds Linux Mod Organizer (https://codeberg.org/enoki/linux-mod-organizer)
+# natively on GitHub's ARM64 runners, then boot-tests the result on real
+# aarch64 hardware (host + clean distro containers) before publishing.
+#
+# NOTE: this can't prove it boots on the Steam Frame itself (Snapdragon +
+# Adreno, SteamOS ARM). It proves: correct arch, no missing libs, glibc floor,
+# and that the GUI actually starts on a native aarch64 Linux kernel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Codeberg branch/tag/commit to build"
+        default: master
+      publish:
+        description: "Create a GitHub release with the AppImage"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 5 * * 1" # weekly smoke build of upstream master
+
+env:
+  UPSTREAM: https://codeberg.org/enoki/linux-mod-organizer.git
+  # Build on the oldest ARM runner image for the lowest glibc floor.
+  MAX_GLIBC: "2.35"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Clone upstream
+        run: |
+          git clone --depth 1 --branch "${{ inputs.ref || 'master' }}" "$UPSTREAM" lmo \
+            || { git clone "$UPSTREAM" lmo && git -C lmo checkout "${{ inputs.ref }}"; }
+          git -C lmo log -1 --oneline
+
+      - name: Read version
+        id: meta
+        run: |
+          v=$(grep -m1 '^version' lmo/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file patchelf pkg-config cmake \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libssl-dev \
+            libayatana-appindicator3-dev libxdo-dev xdg-utils \
+            binutils fuse-overlayfs squashfs-tools
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: lmo/gui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            lmo -> target
+            lmo/gui/src-tauri -> target
+
+      - name: Install frontend deps
+        working-directory: lmo/gui
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - name: Build AppImage (aarch64)
+        working-directory: lmo/gui
+        env:
+          NO_STRIP: "1"                    # linuxdeploy's strip breaks on some aarch64 libs
+          APPIMAGE_EXTRACT_AND_RUN: "1"    # runners have no FUSE 2
+          CI: "true"
+        run: npx tauri build --bundles appimage
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          f=$(find lmo -path '*/bundle/appimage/*.AppImage' | head -n1)
+          test -n "$f" || { echo "No AppImage produced"; exit 1; }
+          out="dist/Linux-Mod-Organizer-${{ steps.meta.outputs.version }}-aarch64.AppImage"
+          cp "$f" "$out"; chmod +x "$out"
+          ls -lh dist
+
+      # ---------- static checks (no execution) ----------
+      - name: Static checks (arch, libs, glibc floor)
+        run: |
+          set -euo pipefail
+          A=$(ls dist/*.AppImage)
+          rm -rf squashfs-root
+          APPIMAGE_EXTRACT_AND_RUN=1 "$A" --appimage-extract >/dev/null
+
+          echo "== AppImage runtime ELF =="
+          file "$A" | grep -q 'ARM aarch64' || { echo "AppImage is not aarch64"; file "$A"; exit 1; }
+
+          echo "== every ELF inside must be aarch64 =="
+          bad=0
+          while IFS= read -r f; do
+            if file -b "$f" | grep -q '^ELF'; then
+              file -b "$f" | grep -q 'ARM aarch64' || { echo "NOT aarch64: $f"; bad=1; }
+            fi
+          done < <(find squashfs-root -type f)
+          [ $bad -eq 0 ]
+
+          echo "== main binary: unresolved libraries =="
+          export LD_LIBRARY_PATH="$PWD/squashfs-root/usr/lib:${LD_LIBRARY_PATH:-}"
+          main=$(find squashfs-root/usr/bin -maxdepth 1 -type f -perm -u+x | head -n1)
+          echo "main: $main"
+          if ldd "$main" | grep 'not found'; then echo "Missing libs above"; exit 1; fi
+
+          echo "== highest GLIBC symbol required (limit $MAX_GLIBC) =="
+          max=$(find squashfs-root -type f -exec sh -c 'file -b "$1" | grep -q "^ELF" && objdump -T "$1" 2>/dev/null' _ {} \; \
+                | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n1)
+          echo "max required glibc: $max"
+          [ "$(printf '%s\n%s\n' "$max" "$MAX_GLIBC" | sort -V | tail -n1)" = "$MAX_GLIBC" ] \
+            || { echo "glibc floor too high"; exit 1; }
+
+      - name: Write boot-test script
+        run: |
+          cat > dist/boot-test.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          # usage: boot-test.sh <AppImage> [seconds]
+          set -uo pipefail
+          APP="$(readlink -f "$1")"; SECS="${2:-25}"
+          WORK="$(mktemp -d)"; LOG="$WORK/boot.log"
+          export HOME="$WORK/home"; mkdir -p "$HOME"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          # CI-only: no GPU, no user-namespace sandbox in containers
+          export LIBGL_ALWAYS_SOFTWARE=1 GDK_BACKEND=x11 NO_AT_BRIDGE=1
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
+          export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+
+          echo "kernel: $(uname -srm)  pagesize: $(getconf PAGESIZE)"
+          [ "$(uname -m)" = "aarch64" ] || { echo "not running on aarch64!"; exit 2; }
+          . /etc/os-release 2>/dev/null && echo "distro: $PRETTY_NAME"
+
+          Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & XVFB=$!
+          export DISPLAY=:99; sleep 2
+
+          "$APP" >"$LOG" 2>&1 & PID=$!
+          alive=1
+          for _ in $(seq 1 "$SECS"); do
+            sleep 1
+            kill -0 "$PID" 2>/dev/null || { alive=0; break; }
+          done
+
+          rc=0
+          if [ $alive -eq 0 ]; then
+            wait "$PID"; echo "FAIL: exited early (rc=$?)"; rc=1
+          else
+            wins=$(xdotool search --onlyvisible --name '.' 2>/dev/null | wc -l)
+            echo "visible X windows: $wins"
+            [ "$wins" -ge 1 ] || { echo "FAIL: process alive but no window mapped"; rc=1; }
+            command -v import >/dev/null && import -window root "$WORK/screen.png" 2>/dev/null \
+              && cp "$WORK/screen.png" "./screen-$(. /etc/os-release; echo "${ID}-${VERSION_ID:-x}").png"
+          fi
+
+          if grep -Eiq 'panicked at|error while loading shared libraries|Illegal instruction|Segmentation fault|cannot open shared object' "$LOG"; then
+            echo "FAIL: fatal pattern in log"; rc=1
+          fi
+
+          echo "---- log (tail) ----"; tail -n 40 "$LOG"
+          kill "$PID" 2>/dev/null; kill "$XVFB" 2>/dev/null
+          [ $rc -eq 0 ] && echo "BOOT OK" || echo "BOOT FAILED"
+          exit $rc
+          SCRIPT
+          chmod +x dist/boot-test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lmo-aarch64-appimage
+          path: dist/
+          if-no-files-found: error
+
+  # ---- real aarch64 kernel, same image as the build host ----
+  boot-host:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: lmo-aarch64-appimage, path: dist }
+      - name: Runtime tools
+        run: sudo apt-get update && sudo apt-get install -y xvfb xdotool imagemagick fuse-overlayfs dbus-x11
+      - name: Boot test
+        run: chmod +x dist/*; cd dist && ./boot-test.sh ./*.AppImage 25
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: boot-host-screenshot, path: dist/screen-*.png, if-no-files-found: ignore }
+
+  # ---- clean distros: proves the bundle is self-contained ----
+  boot-clean-distros:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "ubuntu:22.04", install: "apt" }
+          - { image: "debian:12",    install: "apt" }
+          - { image: "fedora:latest", install: "dnf" }
+    container: ${{ matrix.image }}
+    steps:
+      - name: Minimal runtime (what a bare desktop would have)
+        run: |
+          if [ "${{ matrix.install }}" = apt ]; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              xvfb xdotool imagemagick ca-certificates file libgl1 libegl1 libgles2 \
+              libx11-6 libxkbcommon0 fontconfig fuse-overlayfs
+          else
+            dnf install -y xorg-x11-server-Xvfb xdotool ImageMagick file mesa-libGL \
+              mesa-libEGL mesa-libGLES libxkbcommon fontconfig fuse-overlayfs
+          fi
+      - uses: actions/download-artifact@v4
+        with: { name: lmo-aarch64-appimage, path: dist }
+      - name: Boot test
+        run: chmod +x dist/*; cd dist && ./boot-test.sh ./*.AppImage 25
+
+  release:
+    if: ${{ inputs.publish }}
+    needs: [build, boot-host, boot-clean-distros]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: lmo-aarch64-appimage, path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: lmo-aarch64-v${{ needs.build.outputs.version }}
+          name: LMO ${{ needs.build.outputs.version }} (aarch64 AppImage)
+          files: dist/*.AppImage
+          body: |
+            Unofficial aarch64 build of Linux Mod Organizer ${{ needs.build.outputs.version }}.
+            Requires `fuse-overlayfs` (FUSE 3) on the host.
